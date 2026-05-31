@@ -27,7 +27,13 @@ serde = "1.0"
 serde_json = "1.0"
 sled = "0.34.7"
 tokio = { version = "1.26.0", features = ["full"] }
-tonic_openssl_lnd = "0.2.0"
+tonic_openssl_lnd = { version = "0.2.0", optional = true }
 tower-http = { version = "0.4.0", features = ["cors"] }
 hex = "0.4.3"
 urlencoding = "2.1"
+ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "722fb4f36d2ec0ae296056e4566c3340995007e0", optional = true }
+
+[features]
+default = ["lnd", "ldk-server"]
+lnd = ["dep:tonic_openssl_lnd"]
+ldk-server = ["dep:ldk-server-client"]
