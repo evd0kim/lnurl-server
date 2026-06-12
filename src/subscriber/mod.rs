@@ -1,4 +1,5 @@
 use crate::db::{get_zap, upsert_zap};
+use crate::node::NodeClient;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::key::Secp256k1;
@@ -14,8 +15,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
-use tonic_openssl_lnd::{lnrpc, LndLightningClient};
+
+#[cfg(feature = "ldk-server")]
+mod ldk_server;
+#[cfg(feature = "lnd")]
+mod lnd;
 
 const RELAYS: [&str; 8] = [
     "wss://relay.snort.social",
@@ -39,79 +43,70 @@ const RELAYS: [&str; 8] = [
 /// * `key` - The Nostr keys for signing events
 pub async fn start_invoice_subscription(
     db: Db,
-    mut lnd: LndLightningClient,
+    node: NodeClient,
     key: Keys,
     telegram_token: Option<String>,
     telegram_id: Option<String>,
     name_watcher: Arc<RwLock<HashMap<sha256::Hash, String>>>,
 ) {
-    let client = reqwest::Client::new();
-    loop {
-        println!("Starting invoice subscription");
+    match node {
+        #[cfg(feature = "lnd")]
+        NodeClient::Lnd(client) => {
+            lnd::start(db, client, key, telegram_token, telegram_id, name_watcher).await
+        }
+        #[cfg(feature = "ldk-server")]
+        NodeClient::LdkServer(client) => {
+            ldk_server::start(db, client, key, telegram_token, telegram_id, name_watcher).await
+        }
+        #[allow(unreachable_patterns)]
+        _ => unreachable!("At least one node backend feature must be enabled"),
+    }
+}
 
-        let sub = lnrpc::InvoiceSubscription::default();
-        let mut invoice_stream = lnd
-            .subscribe_invoices(sub)
-            .await
-            .expect("Failed to start invoice subscription")
-            .into_inner();
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_paid_invoice_handler(
+    db: Db,
+    payment_hash: String,
+    keys: Keys,
+    http: reqwest::Client,
+    telegram_token: Option<String>,
+    telegram_id: Option<String>,
+    desc_hash: Vec<u8>,
+    name_watcher: Arc<RwLock<HashMap<sha256::Hash, String>>>,
+) {
+    tokio::spawn(async move {
+        let fut = handle_paid_invoice(
+            &db,
+            payment_hash,
+            keys,
+            http,
+            telegram_token,
+            telegram_id,
+            desc_hash,
+            name_watcher,
+        );
 
-        while let Some(ln_invoice) = invoice_stream
-            .message()
-            .await
-            .expect("Failed to receive invoices")
-        {
-            match InvoiceState::from_i32(ln_invoice.state) {
-                Some(InvoiceState::Settled) => {
-                    let db = db.clone();
-                    let key = key.clone();
-                    let client = client.clone();
-                    let telegram_token = telegram_token.clone();
-                    let telegram_id = telegram_id.clone();
-                    let name_watcher = Arc::clone(&name_watcher);
-                    tokio::spawn(async move {
-                        let fut = handle_paid_invoice(
-                            &db,
-                            hex::encode(ln_invoice.r_hash),
-                            key,
-                            client,
-                            telegram_token,
-                            telegram_id,
-                            ln_invoice.description_hash,
-                            name_watcher,
-                        );
-
-                        match tokio::time::timeout(Duration::from_secs(30), fut).await {
-                            Ok(Ok(source)) => match source {
-                                InvoiceSource::Name(name) => {
-                                    if let Some(name) = name {
-                                        println!("Handled paid invoice with name: {name}");
-                                    } else {
-                                        println!("Handled paid invoice without saved name");
-                                    }
-                                }
-                                InvoiceSource::Zap => {
-                                    println!("Handled paid invoice with zap request!");
-                                }
-                            },
-                            Ok(Err(e)) => {
-                                eprintln!("Failed to handle paid invoice: {e}");
-                            }
-                            Err(_) => {
-                                eprintln!("Timeout");
-                            }
-                        }
-                    });
+        match tokio::time::timeout(Duration::from_secs(30), fut).await {
+            Ok(Ok(source)) => match source {
+                InvoiceSource::Name(name) => {
+                    if let Some(name) = name {
+                        println!("Handled paid invoice with name: {name}");
+                    } else {
+                        println!("Handled paid invoice without saved name");
+                    }
                 }
-                None
-                | Some(InvoiceState::Canceled)
-                | Some(InvoiceState::Open)
-                | Some(InvoiceState::Accepted) => {}
+                InvoiceSource::Zap => {
+                    println!("Handled paid invoice with zap request!");
+                }
+            },
+            Ok(Err(e)) => {
+                eprintln!("Failed to handle paid invoice: {e}");
+            }
+            Err(_) => {
+                eprintln!("Timeout");
             }
         }
-
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

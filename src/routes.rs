@@ -1,4 +1,5 @@
-use crate::db::{upsert_zap, Zap};
+use crate::db::{get_invoice_record, upsert_invoice_record, upsert_zap, InvoiceRecord, Zap};
+use crate::node::parse_invoice;
 use crate::State;
 use anyhow::anyhow;
 use axum::extract::{Path, Query};
@@ -9,11 +10,86 @@ use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 use lnurl::pay::PayResponse;
 use lnurl::Tag;
 use nostr::{Event, JsonUtil};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::str::FromStr;
-use tonic_openssl_lnd::lnrpc;
-use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
+
+/// LUD-09: Success action displayed to user after payment succeeds
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "tag")]
+pub enum SuccessAction {
+    /// Simple message shown as toast/popup
+    #[serde(rename = "message")]
+    Message {
+        /// Message text (max 144 characters)
+        message: String,
+    },
+    /// URL to open after payment
+    #[serde(rename = "url")]
+    Url {
+        /// Description of the action (max 144 characters)
+        description: String,
+        /// URL to open (domain must match callback domain)
+        url: String,
+    },
+}
+
+impl SuccessAction {
+    /// Validate success action according to LUD-09 spec
+    pub fn validate(&self, callback_domain: &str) -> anyhow::Result<()> {
+        match self {
+            SuccessAction::Message { message } => {
+                if message.is_empty() {
+                    return Err(anyhow!("Message cannot be empty"));
+                }
+                if message.len() > 144 {
+                    return Err(anyhow!(
+                        "Message must be <= 144 characters (got {})",
+                        message.len()
+                    ));
+                }
+                Ok(())
+            }
+            SuccessAction::Url {
+                description,
+                url,
+            } => {
+                if description.is_empty() {
+                    return Err(anyhow!("Description cannot be empty"));
+                }
+                if description.len() > 144 {
+                    return Err(anyhow!(
+                        "Description must be <= 144 characters (got {})",
+                        description.len()
+                    ));
+                }
+
+                // Validate URL domain matches callback domain
+                let url_domain = extract_domain(url)
+                    .ok_or_else(|| anyhow!("Invalid URL format"))?;
+
+                if url_domain != callback_domain {
+                    return Err(anyhow!(
+                        "Success action URL domain ({}) must match callback domain ({})",
+                        url_domain,
+                        callback_domain
+                    ));
+                }
+
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Extract domain from URL
+fn extract_domain(url: &str) -> Option<String> {
+    url.split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .map(|domain| domain.split(':').next().unwrap_or(domain).to_string())
+}
 
 /// Creates a Lightning invoice and optionally stores zap request information.
 ///
@@ -33,7 +109,6 @@ pub(crate) async fn get_invoice_impl(
     amount_msats: u64,
     zap_request: Option<Event>,
 ) -> anyhow::Result<String> {
-    let mut lnd = state.lnd.clone();
     let desc_hash = match zap_request.as_ref() {
         None => sha256::Hash::from_str(hash)?,
         Some(event) => {
@@ -45,28 +120,30 @@ pub(crate) async fn get_invoice_impl(
         }
     };
 
-    let request = lnrpc::Invoice {
-        value_msat: amount_msats as i64,
-        description_hash: desc_hash.to_byte_array().to_vec(),
-        expiry: 86_400,
-        private: state.route_hints,
-        ..Default::default()
-    };
-
-    let resp = lnd.add_invoice(request).await?.into_inner();
+    let invoice = state
+        .node
+        .create_invoice(desc_hash, amount_msats, state.route_hints)
+        .await?;
+    let bolt11 = parse_invoice(&invoice.payment_request)?;
+    upsert_invoice_record(
+        &state.db,
+        invoice.payment_hash.clone(),
+        InvoiceRecord {
+            invoice: bolt11.clone(),
+            desc_hash: hex::encode(desc_hash.to_byte_array()),
+        },
+    )?;
 
     if let Some(zap_request) = zap_request {
-        let invoice = Bolt11Invoice::from_str(&resp.payment_request)
-            .map_err(|_| anyhow!("Invalid invoice format"))?;
         let zap = Zap {
-            invoice,
+            invoice: bolt11,
             request: zap_request,
             note_id: None,
         };
-        upsert_zap(&state.db, hex::encode(resp.r_hash), zap)?;
+        upsert_zap(&state.db, invoice.payment_hash, zap)?;
     }
 
-    Ok(resp.payment_request)
+    Ok(invoice.payment_request)
 }
 
 /// HTTP endpoint for generating Lightning invoices from a LNURL-pay request.
@@ -127,14 +204,22 @@ pub async fn get_invoice(
                     })),
                 )
             })?;
-            let payment_hash = hex::encode(invoice.payment_hash().to_byte_array());
-            let verify_url = format!("https://{}/verify/{hash}/{payment_hash}", state.domain);
-            Ok(Json(json!({
-                "status": "OK",
-                "pr": invoice,
-                "verify": verify_url,
+            let mut response = json!({
+                "pr": invoice.to_string(),
                 "routes": [],
-            })))
+            });
+
+            // Add LUD-09 successAction if configured
+            if let Some(action) = &state.success_action {
+                response["successAction"] = serde_json::to_value(action).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"status": "ERROR", "reason": format!("{e}")})),
+                    )
+                })?;
+            }
+
+            Ok(Json(response))
         }
         Err(e) => Err(handle_anyhow_error(e)),
     }
@@ -213,8 +298,6 @@ pub async fn verify(
     Path((desc_hash, pay_hash)): Path<(String, String)>,
     Extension(state): Extension<State>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut lnd = state.lnd.clone();
-
     let desc_hash: Vec<u8> = hex::decode(desc_hash).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -234,15 +317,11 @@ pub async fn verify(
             })),
         )
     })?;
+    let pay_hash_hex = hex::encode(&pay_hash);
 
-    let request = lnrpc::PaymentHash {
-        r_hash: pay_hash.to_vec(),
-        ..Default::default()
-    };
-
-    let resp = match lnd.lookup_invoice(request).await {
-        Ok(resp) => resp.into_inner(),
-        Err(_) => {
+    let status = match state.node.lookup_invoice(&pay_hash_hex).await {
+        Ok(Some(status)) => status,
+        Ok(None) | Err(_) => {
             return Ok(Json(json!({
                 "status": "ERROR",
                 "reason": "Not found",
@@ -250,7 +329,22 @@ pub async fn verify(
         }
     };
 
-    let invoice = Bolt11Invoice::from_str(&resp.payment_request).map_err(|_| {
+    let invoice = match status.payment_request {
+        Some(payment_request) => Bolt11Invoice::from_str(&payment_request),
+        None => Ok(get_invoice_record(&state.db, &pay_hash_hex)
+            .map_err(handle_anyhow_error)?
+            .map(|record| record.invoice)
+            .ok_or_else(|| {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "ERROR",
+                        "reason": "Not found",
+                    })),
+                )
+            })?),
+    }
+    .map_err(|_| {
         (
             StatusCode::OK,
             Json(json!({
@@ -267,8 +361,8 @@ pub async fn verify(
         }))),
         Bolt11InvoiceDescriptionRef::Hash(h) => {
             if h.0.to_byte_array().to_vec() == desc_hash {
-                if resp.state() == InvoiceState::Settled && !resp.r_preimage.is_empty() {
-                    let preimage = hex::encode(resp.r_preimage);
+                if status.settled {
+                    let preimage = status.preimage.unwrap_or_default();
                     Ok(Json(json!({
                         "status": "OK",
                         "settled": true,

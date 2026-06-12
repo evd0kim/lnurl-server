@@ -16,23 +16,26 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::spawn;
 use tokio::sync::RwLock;
-use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse};
-use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::*;
+use crate::node::NodeClient;
 use crate::routes::*;
 use crate::subscriber::start_invoice_subscription;
 
 mod config;
 mod db;
+mod node;
 mod routes;
 mod subscriber;
+
+#[cfg(not(any(feature = "lnd", feature = "ldk-server", feature = "phoenixd")))]
+compile_error!("At least one of the `lnd`, `ldk-server`, or `phoenixd` features must be enabled.");
 
 #[derive(Clone)]
 pub struct State {
     pub db: Db,
-    pub lnd: LndLightningClient,
+    pub node: NodeClient,
     pub keys: Keys,
     pub name_watcher: Arc<RwLock<HashMap<sha256::Hash, String>>>,
 
@@ -41,29 +44,13 @@ pub struct State {
     pub route_hints: bool,
     pub min_sendable: u64,
     pub max_sendable: u64,
+    pub success_action: Option<SuccessAction>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config: Config = Config::parse();
-
-    let mut client = tonic_openssl_lnd::connect(
-        config.lnd_host.clone(),
-        config.lnd_port,
-        config.cert_file(),
-        config.macaroon_file(),
-    )
-    .await
-    .expect("failed to connect");
-
-    let mut ln_client = client.lightning().clone();
-    let lnd_info: GetInfoResponse = ln_client
-        .get_info(GetInfoRequest {})
-        .await
-        .expect("Failed to get lnd info")
-        .into_inner();
-
-    println!("Connected to LND: {}", lnd_info.identity_pubkey);
+    let node = NodeClient::connect(&config).await?;
 
     // Create the datadir if it doesn't exist
     let path = PathBuf::from(&config.data_dir);
@@ -86,15 +73,19 @@ async fn main() -> anyhow::Result<()> {
 
     let keys = get_keys(keys_path);
 
+    // Build LUD-09 success action from config
+    let success_action = build_success_action(&config)?;
+
     let state = State {
         db,
-        lnd: client.lightning().clone(),
+        node,
         keys: keys.clone(),
         name_watcher: Arc::new(RwLock::new(HashMap::new())),
         domain: config.domain.clone(),
         route_hints: config.route_hints,
         min_sendable: config.min_sendable,
         max_sendable: config.max_sendable,
+        success_action,
     };
 
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
@@ -122,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     // Invoice event stream
     spawn(start_invoice_subscription(
         state.db.clone(),
-        state.lnd.clone(),
+        state.node.clone(),
         keys,
         config.telegram_token,
         config.telegram_chat_id,
@@ -150,7 +141,10 @@ async fn main() -> anyhow::Result<()> {
             name_watcher.insert(hash, parts[1].to_string());
         }
 
-        println!("Precomputed {} names for LNURL pay server", name_watcher.len());
+        println!(
+            "Precomputed {} names for LNURL pay server",
+            name_watcher.len()
+        );
     }
 
     let graceful = server.with_graceful_shutdown(async {
@@ -243,6 +237,37 @@ impl HealthResponse {
         Self {
             status: String::from("pass"),
             version: String::from("0"),
+        }
+    }
+}
+
+/// Build LUD-09 success action from configuration
+fn build_success_action(config: &Config) -> anyhow::Result<Option<SuccessAction>> {
+    match (&config.success_message, &config.success_url) {
+        (Some(message), None) => {
+            let action = SuccessAction::Message {
+                message: message.clone(),
+            };
+            action.validate(&config.domain)?;
+            Ok(Some(action))
+        }
+        (None, Some(url)) => {
+            let description = config
+                .success_url_description
+                .clone()
+                .unwrap_or_else(|| "View details".to_string());
+            let action = SuccessAction::Url {
+                description,
+                url: url.clone(),
+            };
+            action.validate(&config.domain)?;
+            Ok(Some(action))
+        }
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => {
+            Err(anyhow::anyhow!(
+                "Cannot specify both success_message and success_url"
+            ))
         }
     }
 }
