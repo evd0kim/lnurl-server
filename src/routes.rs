@@ -211,7 +211,12 @@ pub async fn get_invoice(
 
             // Add LUD-09 successAction if configured
             if let Some(action) = &state.success_action {
-                response["successAction"] = serde_json::to_value(action).unwrap();
+                response["successAction"] = serde_json::to_value(action).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"status": "ERROR", "reason": format!("{e}")})),
+                    )
+                })?;
             }
 
             Ok(Json(response))

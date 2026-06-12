@@ -20,7 +20,6 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::*;
 use crate::node::NodeClient;
-use crate::routes::SuccessAction;
 use crate::routes::*;
 use crate::subscriber::start_invoice_subscription;
 
