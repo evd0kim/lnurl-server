@@ -1,9 +1,9 @@
 use crate::config::Config;
-#[cfg(any(feature = "lnd", feature = "ldk-server"))]
+#[cfg(any(feature = "lnd", feature = "ldk-server", feature = "phoenixd"))]
 use crate::config::NodeBackend;
 use anyhow::{anyhow, bail};
 use bitcoin::hashes::sha256;
-#[cfg(any(feature = "lnd", feature = "ldk-server"))]
+#[cfg(any(feature = "lnd", feature = "ldk-server", feature = "phoenixd"))]
 use bitcoin::hashes::Hash;
 use lightning_invoice::Bolt11Invoice;
 use std::str::FromStr;
@@ -30,12 +30,17 @@ use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse};
 #[cfg(feature = "lnd")]
 use tonic_openssl_lnd::LndLightningClient;
 
+#[cfg(feature = "phoenixd")]
+use phoenixd_rs::Phoenixd;
+
 #[derive(Clone)]
 pub enum NodeClient {
     #[cfg(feature = "lnd")]
     Lnd(LndLightningClient),
     #[cfg(feature = "ldk-server")]
     LdkServer(Arc<LdkServerClient>),
+    #[cfg(feature = "phoenixd")]
+    Phoenixd(Phoenixd),
 }
 
 pub struct CreatedInvoice {
@@ -90,6 +95,17 @@ impl NodeClient {
                 println!("Connected to LDK Server: {}", info.node_id);
                 Ok(Self::LdkServer(Arc::new(client)))
             }
+            #[cfg(feature = "phoenixd")]
+            NodeBackend::Phoenixd => {
+                let url = config.phoenixd_url.clone()
+                    .ok_or_else(|| anyhow!("LNURL_PHOENIXD_URL must be set for Phoenixd backend"))?;
+                let api_password = config.phoenixd_api_key.clone()
+                    .ok_or_else(|| anyhow!("LNURL_PHOENIXD_API_KEY must be set for Phoenixd backend"))?;
+
+                let client = Phoenixd::new(&api_password, &url)?;
+                println!("Connected to Phoenixd");
+                Ok(Self::Phoenixd(client))
+            }
             #[allow(unreachable_patterns)]
             backend => bail!("Backend {backend:?} is not enabled at compile time"),
         }
@@ -140,6 +156,23 @@ impl NodeClient {
                     payment_hash: resp.payment_hash,
                 })
             }
+            #[cfg(feature = "phoenixd")]
+            Self::Phoenixd(client) => {
+                let invoice_req = phoenixd_rs::InvoiceRequest {
+                    external_id: None,
+                    description: None,
+                    description_hash: Some(hex::encode(desc_hash.to_byte_array())),
+                    amount_sat: amount_msats / 1000,
+                    webhook_url: None,
+                };
+
+                let invoice_resp = client.create_invoice(invoice_req).await?;
+
+                Ok(CreatedInvoice {
+                    payment_request: invoice_resp.serialized,
+                    payment_hash: invoice_resp.payment_hash,
+                })
+            }
             #[allow(unreachable_patterns)]
             _ => bail!("No node backend feature is enabled"),
         }
@@ -181,6 +214,26 @@ impl NodeClient {
                 }
 
                 Ok(None)
+            }
+            #[cfg(feature = "phoenixd")]
+            Self::Phoenixd(client) => {
+                let invoice_resp = match client.get_incoming_invoice(payment_hash).await {
+                    Ok(resp) => resp,
+                    Err(_) => return Ok(None),
+                };
+
+                let settled = invoice_resp.is_paid;
+                let preimage = if !invoice_resp.preimage.is_empty() {
+                    Some(invoice_resp.preimage)
+                } else {
+                    None
+                };
+
+                Ok(Some(InvoiceStatus {
+                    payment_request: invoice_resp.invoice,
+                    settled,
+                    preimage,
+                }))
             }
             #[allow(unreachable_patterns)]
             _ => bail!("No node backend feature is enabled"),

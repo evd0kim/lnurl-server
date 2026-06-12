@@ -13,7 +13,7 @@ name = "lnurl-server"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0"
+anyhow = "1.0.102"
 axum = "0.6.20"
 bitcoin = { version = "0.32.7", features = ["serde"] }
 clap = { version = "4.1.14", features = ["derive", "env"] }
@@ -32,8 +32,10 @@ tower-http = { version = "0.4.0", features = ["cors"] }
 hex = "0.4.3"
 urlencoding = "2.1"
 ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "722fb4f36d2ec0ae296056e4566c3340995007e0", optional = true }
+phoenixd-rs = { git = "https://github.com/evd0kim/phoenixd-rs", optional = true }
 
 [features]
 default = ["lnd", "ldk-server"]
 lnd = ["dep:tonic_openssl_lnd"]
 ldk-server = ["dep:ldk-server-client"]
+phoenixd = ["dep:phoenixd-rs"]

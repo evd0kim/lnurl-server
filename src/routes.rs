@@ -10,9 +10,86 @@ use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 use lnurl::pay::PayResponse;
 use lnurl::Tag;
 use nostr::{Event, JsonUtil};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::str::FromStr;
+
+/// LUD-09: Success action displayed to user after payment succeeds
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "tag")]
+pub enum SuccessAction {
+    /// Simple message shown as toast/popup
+    #[serde(rename = "message")]
+    Message {
+        /// Message text (max 144 characters)
+        message: String,
+    },
+    /// URL to open after payment
+    #[serde(rename = "url")]
+    Url {
+        /// Description of the action (max 144 characters)
+        description: String,
+        /// URL to open (domain must match callback domain)
+        url: String,
+    },
+}
+
+impl SuccessAction {
+    /// Validate success action according to LUD-09 spec
+    pub fn validate(&self, callback_domain: &str) -> anyhow::Result<()> {
+        match self {
+            SuccessAction::Message { message } => {
+                if message.is_empty() {
+                    return Err(anyhow!("Message cannot be empty"));
+                }
+                if message.len() > 144 {
+                    return Err(anyhow!(
+                        "Message must be <= 144 characters (got {})",
+                        message.len()
+                    ));
+                }
+                Ok(())
+            }
+            SuccessAction::Url {
+                description,
+                url,
+            } => {
+                if description.is_empty() {
+                    return Err(anyhow!("Description cannot be empty"));
+                }
+                if description.len() > 144 {
+                    return Err(anyhow!(
+                        "Description must be <= 144 characters (got {})",
+                        description.len()
+                    ));
+                }
+
+                // Validate URL domain matches callback domain
+                let url_domain = extract_domain(url)
+                    .ok_or_else(|| anyhow!("Invalid URL format"))?;
+
+                if url_domain != callback_domain {
+                    return Err(anyhow!(
+                        "Success action URL domain ({}) must match callback domain ({})",
+                        url_domain,
+                        callback_domain
+                    ));
+                }
+
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Extract domain from URL
+fn extract_domain(url: &str) -> Option<String> {
+    url.split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .map(|domain| domain.split(':').next().unwrap_or(domain).to_string())
+}
 
 /// Creates a Lightning invoice and optionally stores zap request information.
 ///
@@ -127,14 +204,17 @@ pub async fn get_invoice(
                     })),
                 )
             })?;
-            let payment_hash = hex::encode(invoice.payment_hash().to_byte_array());
-            let verify_url = format!("https://{}/verify/{hash}/{payment_hash}", state.domain);
-            Ok(Json(json!({
-                "status": "OK",
-                "pr": invoice,
-                "verify": verify_url,
+            let mut response = json!({
+                "pr": invoice.to_string(),
                 "routes": [],
-            })))
+            });
+
+            // Add LUD-09 successAction if configured
+            if let Some(action) = &state.success_action {
+                response["successAction"] = serde_json::to_value(action).unwrap();
+            }
+
+            Ok(Json(response))
         }
         Err(e) => Err(handle_anyhow_error(e)),
     }

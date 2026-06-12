@@ -20,6 +20,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::*;
 use crate::node::NodeClient;
+use crate::routes::SuccessAction;
 use crate::routes::*;
 use crate::subscriber::start_invoice_subscription;
 
@@ -29,8 +30,8 @@ mod node;
 mod routes;
 mod subscriber;
 
-#[cfg(not(any(feature = "lnd", feature = "ldk-server")))]
-compile_error!("At least one of the `lnd` or `ldk-server` features must be enabled.");
+#[cfg(not(any(feature = "lnd", feature = "ldk-server", feature = "phoenixd")))]
+compile_error!("At least one of the `lnd`, `ldk-server`, or `phoenixd` features must be enabled.");
 
 #[derive(Clone)]
 pub struct State {
@@ -44,6 +45,7 @@ pub struct State {
     pub route_hints: bool,
     pub min_sendable: u64,
     pub max_sendable: u64,
+    pub success_action: Option<SuccessAction>,
 }
 
 #[tokio::main]
@@ -72,6 +74,9 @@ async fn main() -> anyhow::Result<()> {
 
     let keys = get_keys(keys_path);
 
+    // Build LUD-09 success action from config
+    let success_action = build_success_action(&config)?;
+
     let state = State {
         db,
         node,
@@ -81,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         route_hints: config.route_hints,
         min_sendable: config.min_sendable,
         max_sendable: config.max_sendable,
+        success_action,
     };
 
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
@@ -232,6 +238,37 @@ impl HealthResponse {
         Self {
             status: String::from("pass"),
             version: String::from("0"),
+        }
+    }
+}
+
+/// Build LUD-09 success action from configuration
+fn build_success_action(config: &Config) -> anyhow::Result<Option<SuccessAction>> {
+    match (&config.success_message, &config.success_url) {
+        (Some(message), None) => {
+            let action = SuccessAction::Message {
+                message: message.clone(),
+            };
+            action.validate(&config.domain)?;
+            Ok(Some(action))
+        }
+        (None, Some(url)) => {
+            let description = config
+                .success_url_description
+                .clone()
+                .unwrap_or_else(|| "View details".to_string());
+            let action = SuccessAction::Url {
+                description,
+                url: url.clone(),
+            };
+            action.validate(&config.domain)?;
+            Ok(Some(action))
+        }
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => {
+            Err(anyhow::anyhow!(
+                "Cannot specify both success_message and success_url"
+            ))
         }
     }
 }

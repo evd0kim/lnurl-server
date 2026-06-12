@@ -5,6 +5,7 @@ use clap::{Parser, ValueEnum};
 pub enum NodeBackend {
     Lnd,
     LdkServer,
+    Phoenixd,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -51,6 +52,14 @@ pub struct Config {
     #[clap(long, env = "LNURL_LDK_SERVER_API_KEY_FILE")]
     ldk_server_api_key_file: Option<String>,
 
+    /// URL of the Phoenixd server
+    #[clap(long, env = "LNURL_PHOENIXD_URL")]
+    pub phoenixd_url: Option<String>,
+
+    /// API key for Phoenixd authentication
+    #[clap(long, env = "LNURL_PHOENIXD_API_KEY")]
+    pub phoenixd_api_key: Option<String>,
+
     /// Network lnd is running on ["bitcoin", "testnet", "signet, "regtest"]
     #[clap(default_value_t = Network::Bitcoin, short, long, env = "LNURL_NETWORK")]
     pub network: Network,
@@ -96,6 +105,18 @@ pub struct Config {
     /// e.g. "abc123:alice"
     #[clap(long)]
     pub proxied_name: Vec<String>,
+
+    /// LUD-09: Success action message to display after payment
+    #[clap(long, env = "LNURL_SUCCESS_MESSAGE")]
+    pub success_message: Option<String>,
+
+    /// LUD-09: Success action URL to open after payment
+    #[clap(long, env = "LNURL_SUCCESS_URL")]
+    pub success_url: Option<String>,
+
+    /// LUD-09: Success action URL description
+    #[clap(long, env = "LNURL_SUCCESS_URL_DESCRIPTION")]
+    pub success_url_description: Option<String>,
 }
 
 impl Config {
@@ -153,7 +174,12 @@ fn default_node_backend() -> NodeBackend {
     NodeBackend::LdkServer
 }
 
-#[cfg(not(any(feature = "lnd", feature = "ldk-server")))]
+#[cfg(all(not(feature = "lnd"), not(feature = "ldk-server"), feature = "phoenixd"))]
+fn default_node_backend() -> NodeBackend {
+    NodeBackend::Phoenixd
+}
+
+#[cfg(not(any(feature = "lnd", feature = "ldk-server", feature = "phoenixd")))]
 fn default_node_backend() -> NodeBackend {
     unreachable!("At least one node backend feature must be enabled")
 }
